@@ -707,6 +707,7 @@ const JSWaitQueueDefaultMax = 512
 type JSApiConsumerCreateResponse struct {
 	ApiResponse
 	*ConsumerInfo
+	StreamIdentity string `json:"stream_identity,omitempty"`
 }
 
 const JSApiConsumerCreateResponseType = "io.nats.jetstream.api.v1.consumer_create_response"
@@ -779,7 +780,8 @@ type JSApiConsumerResetRequest struct {
 type JSApiConsumerResetResponse struct {
 	ApiResponse
 	*ConsumerInfo
-	ResetSeq uint64 `json:"reset_seq"`
+	ResetSeq       uint64 `json:"reset_seq"`
+	StreamIdentity string `json:"stream_identity,omitempty"`
 }
 
 const JSApiConsumerResetResponseType = "io.nats.jetstream.api.v1.consumer_reset_response"
@@ -4579,7 +4581,7 @@ func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Accoun
 	}
 
 	if isClustered && !direct {
-		s.jsClusteredConsumerRequest(ci, acc, subject, reply, rmsg, req.Stream, &req.Config, req.Action, req.Pedantic)
+		s.jsClusteredConsumerRequest(ci, acc, subject, reply, rmsg, &req)
 		return
 	}
 
@@ -4599,6 +4601,14 @@ func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Accoun
 	if stream.offlineReason != _EMPTY_ {
 		resp.Error = NewJSStreamOfflineReasonError(errors.New(stream.offlineReason))
 		s.sendDelayedAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp), nil, errRespDelay)
+		return
+	}
+
+	// If the user provided an expected stream identity, reject the request on a mismatch.
+	streamIdentity := stream.identity()
+	if req.StreamIdentity != _EMPTY_ && req.StreamIdentity != streamIdentity {
+		resp.Error = NewJSConsumerStreamIdentityMismatchError(streamIdentity)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
 
@@ -4654,6 +4664,7 @@ func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Accoun
 		return
 	}
 	resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.initialInfo())
+	resp.StreamIdentity = streamIdentity
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 
 	o.mu.RLock()

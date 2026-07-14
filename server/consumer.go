@@ -152,6 +152,9 @@ type CreateConsumerRequest struct {
 	Config   ConsumerConfig `json:"config"`
 	Action   ConsumerAction `json:"action"`
 	Pedantic bool           `json:"pedantic,omitempty"`
+
+	// Consumer is rejected if the stream identity does not match.
+	StreamIdentity string `json:"stream_identity,omitempty"`
 }
 
 type ConsumerAction int
@@ -4553,6 +4556,7 @@ func (o *consumer) processResetReq(_ *subscription, c *client, a *Account, _, re
 	} else if canRespond {
 		resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
 		resp.ResetSeq = resetSeq
+		resp.StreamIdentity = o.streamIdentity()
 		s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
 	}
 }
@@ -6424,6 +6428,18 @@ func (o *consumer) streamName() string {
 	o.mu.RUnlock()
 	if mset != nil {
 		return mset.name()
+	}
+	return _EMPTY_
+}
+
+// streamIdentity returns the identity of the consumer's stream, which changes
+// if the stream is recreated. Returns empty if the stream is not available.
+func (o *consumer) streamIdentity() string {
+	o.mu.RLock()
+	mset := o.mset
+	o.mu.RUnlock()
+	if mset != nil {
+		return mset.identity()
 	}
 	return _EMPTY_
 }

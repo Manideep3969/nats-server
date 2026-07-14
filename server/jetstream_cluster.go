@@ -6276,6 +6276,7 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 								s.sendAPIErrResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 							} else {
 								resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
+								resp.StreamIdentity = mset.identity()
 								s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 							}
 						},
@@ -6361,11 +6362,13 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 							} else if canRespond {
 								resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
 								resp.ResetSeq = resetSeq
+								resp.StreamIdentity = mset.identity()
 								s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 							}
 						} else {
 							var resp = JSApiConsumerCreateResponse{ApiResponse: ApiResponse{Type: JSApiConsumerCreateResponseType}}
 							resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
+							resp.StreamIdentity = mset.identity()
 							s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 						}
 					}
@@ -7103,6 +7106,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						var resp = JSApiConsumerResetResponse{ApiResponse: ApiResponse{Type: JSApiConsumerResetResponseType}}
 						resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
 						resp.ResetSeq = sseq
+						resp.StreamIdentity = o.streamIdentity()
 						s.sendInternalAccountMsg(a, reply, s.jsonResponse(&resp))
 					}
 				}
@@ -7320,10 +7324,12 @@ func (js *jetStream) processConsumerLeaderChangeWithAssignment(o *consumer, ca *
 			} else if canRespond {
 				rresp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.info())
 				rresp.ResetSeq = resetSeq
+				rresp.StreamIdentity = o.streamIdentity()
 				s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&rresp))
 			}
 		} else {
 			resp.ConsumerInfo = setDynamicConsumerInfoMetadata(o.initialInfo())
+			resp.StreamIdentity = o.streamIdentity()
 			s.sendAPIResponse(client, acc, subject, reply, _EMPTY_, s.jsonResponse(&resp))
 		}
 		o.sendCreateAdvisory()
@@ -9562,11 +9568,13 @@ func (cc *jetStreamCluster) createGroupForConsumer(cfg *ConsumerConfig, sa *stre
 }
 
 // jsClusteredConsumerRequest is first point of entry to create a consumer in clustered mode.
-func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, stream string, cfg *ConsumerConfig, action ConsumerAction, pedantic bool) {
+func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subject, reply string, rmsg []byte, req *CreateConsumerRequest) {
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil {
 		return
 	}
+
+	stream, cfg, action, pedantic := req.Stream, &req.Config, req.Action, req.Pedantic
 
 	// If the consumer is a direct sourcing consumer, we need to "upgrade" it to be durable without AckNone.
 	// We only get here if the stream is not Limits-based.
@@ -9618,6 +9626,14 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 	sa := js.streamAssignmentOrInflight(acc.Name, stream)
 	if sa == nil {
 		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+		return
+	}
+
+	// If the user provided an expected stream identity, reject the request on a mismatch.
+	streamIdentity := sa.identity()
+	if req.StreamIdentity != _EMPTY_ && req.StreamIdentity != streamIdentity {
+		resp.Error = NewJSConsumerStreamIdentityMismatchError(streamIdentity)
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 		return
 	}
