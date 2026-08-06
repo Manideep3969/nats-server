@@ -2752,69 +2752,174 @@ func (rg *raftGroup) copyGroup() *raftGroup {
 
 // Lock should be held.
 func (sa *streamAssignment) missingPeers() bool {
-	return len(sa.Group.Peers) < sa.Config.Replicas
+	targetPeers := sa.targetPeers()
+	return len(targetPeers) < sa.Config.Replicas
 }
 
-// Called when we detect a new peer. Only the leader will process checking
-// for any streams, and consequently any consumers.
-func (js *jetStream) processAddPeer(peer string) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
+// The peer set this stream, and its consumers, must end up on.
+// Lock should be held.
+func (sa *streamAssignment) targetPeers() []string {
+	targetPeers := sa.Group.Peers
+	if sa.Group.Desired != nil {
+		// Peers are only known if not scaling down.
+		if !sa.Group.Desired.ScaleDown {
+			targetPeers = sa.Group.Desired.Peers
+		}
+	} else if len(targetPeers) > sa.Config.Replicas {
+		// If the stream is already moving, without desired state, the last N peers are the target.
+		targetPeers = targetPeers[len(targetPeers)-sa.Config.Replicas:]
+	}
+	return targetPeers
+}
 
-	s, cc := js.srv, js.cluster
-	if cc == nil || cc.meta == nil {
+// Returns the group's peers that are no longer part of the meta peer set.
+// Lock should be held.
+func (rg *raftGroup) stalePeers(metaPeers map[string]struct{}) []string {
+	var stale []string
+	for _, p := range rg.Peers {
+		if _, ok := metaPeers[p]; !ok {
+			stale = append(stale, p)
+		}
+	}
+	if rg.Desired != nil {
+		for _, p := range rg.Desired.Peers {
+			if _, ok := metaPeers[p]; !ok && !slices.Contains(stale, p) {
+				stale = append(stale, p)
+			}
+		}
+	}
+	return stale
+}
+
+// peerSelectable reports whether we've received STATSZ for this node.
+func (s *Server) peerSelectable(peer string) bool {
+	si, ok := s.nodeToInfo.Load(peer)
+	if !ok || si == nil {
+		return false
+	}
+	return si.(nodeInfo).selectable()
+}
+
+// Called when a peer is added to the meta group. Reconciling only makes sense
+// once we can actually place on it, so hold it until its first STATSZ arrives.
+func (js *jetStream) processAddPeer(peer string) {
+	// Only the meta leader reconciles, check the atomic so we don't need the JS lock.
+	if !js.srv.isMetaLeader.Load() {
 		return
 	}
-	isLeader := cc.isLeader()
+	js.prMu.Lock()
+	if js.prNewPeers == nil {
+		js.prNewPeers = make(map[string]struct{})
+	}
+	js.prNewPeers[peer] = struct{}{}
+	js.prMu.Unlock()
 
-	// Now check if we are meta-leader. We will check for any re-assignments.
+	// Must track before checking, or STATSZ landing in between would find nothing
+	// tracked while we'd go on waiting for a transition that already happened.
+	if js.srv.peerSelectable(peer) {
+		js.processPeerStatsz(peer)
+	}
+}
+
+// Called when we gain or lose meta leadership, to reset which peers we're still
+// waiting on.
+// Lock should be held.
+func (js *jetStream) seedNewPeers(isLeader bool) {
+	js.prMu.Lock()
+	defer js.prMu.Unlock()
+
+	// Anything we were waiting on is from a term we no longer own.
+	js.prNewPeers = nil
 	if !isLeader {
 		return
 	}
 
-	sir, ok := s.nodeToInfo.Load(peer)
-	if !ok || sir == nil {
+	cc := js.cluster
+	if cc == nil || cc.meta == nil {
 		return
 	}
-	si := sir.(nodeInfo)
-
-	for accName, sa := range js.streamAssignmentsOrInflightSeqAllAccounts() {
-		if sa.unsupported != nil {
+	s := js.srv
+	for _, p := range cc.meta.Peers() {
+		if s.peerSelectable(p.ID) {
 			continue
 		}
-		if sa.missingPeers() {
-			// Make sure the right cluster etc.
-			if si.cluster != sa.Client.Cluster {
-				continue
-			}
-			// If we are here we can add in this peer.
-			csa := sa.copyGroup()
-			csa.Group.Peers = append(csa.Group.Peers, peer)
-			// Keep the desired peer set in sync.
-			if d := csa.Group.Desired; d != nil {
-				d.ID = nuid.Next()
-				d.Peers = csa.Group.Peers
-				d.Preferred = _EMPTY_
-			}
-			// Send our proposal for this csa. Also use same group definition for all the consumers as well.
-			consumers, deleted, _ := js.remapConsumerAssignments(accName, csa)
-			if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(csa)); err != nil {
-				return
-			}
-			cc.trackInflightStreamProposal(accName, csa, false)
-			for _, cca := range consumers {
-				if err := cc.meta.Propose(cc.term, encodeAddConsumerAssignment(cca)); err != nil {
-					return
-				}
-				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
-			}
-			for _, ca := range deleted {
-				if err := cc.meta.Propose(cc.term, encodeDeleteConsumerAssignment(ca)); err != nil {
-					return
-				}
-				cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
-			}
+		if js.prNewPeers == nil {
+			js.prNewPeers = make(map[string]struct{})
 		}
+		js.prNewPeers[p.ID] = struct{}{}
+	}
+}
+
+// Called on a STATSZ that makes a node selectable for placement. Only meta peers
+// that were just added are of interest, everything else either can't be placed
+// on or was already reconciled when it joined.
+func (js *jetStream) processPeerStatsz(peer string) {
+	// Only the meta leader reconciles, check the atomic so we don't need the JS lock.
+	if !js.srv.isMetaLeader.Load() {
+		return
+	}
+	js.prMu.Lock()
+	_, isNew := js.prNewPeers[peer]
+	delete(js.prNewPeers, peer)
+	js.prMu.Unlock()
+
+	if isNew {
+		js.signalPeerReconcile(peer)
+	}
+}
+
+// Signals that assignments should be reconciled for this peer.
+// Only the leader will process checking.
+func (js *jetStream) signalPeerReconcile(peer string) {
+	// Only the meta leader reconciles, check the atomic so we don't need the JS lock.
+	if !js.srv.isMetaLeader.Load() {
+		return
+	}
+	js.prMu.Lock()
+	defer js.prMu.Unlock()
+
+	if js.prPeers == nil {
+		js.prPeers = make(map[string]struct{})
+	}
+	js.prPeers[peer] = struct{}{}
+
+	// A sweep is already in flight, it will pick this peer up.
+	if js.prRunning {
+		return
+	}
+	// Don't hold up the caller, and don't propose under its locks.
+	js.prRunning = true
+	if !js.srv.startGoRoutine(js.runPeerReconcile) {
+		js.prRunning, js.prPeers = false, nil
+	}
+}
+
+// Reconciles assignments for all peers signaled through signalPeerReconcile,
+// until none are left pending. Runs on its own goroutine, one at a time.
+func (js *jetStream) runPeerReconcile() {
+	defer js.srv.grWG.Done()
+
+	for {
+		js.prMu.Lock()
+		peers := js.prPeers
+		js.prPeers = nil
+		// Stop once nothing is left pending. Clearing must happen under the same
+		// lock as the check, or a peer signaled right now would be dropped.
+		if len(peers) == 0 {
+			js.prRunning = false
+			js.prMu.Unlock()
+			return
+		}
+		js.prMu.Unlock()
+
+		js.mu.Lock()
+		cc := js.cluster
+		// Only reconcile if we're in a position to, drop these peers otherwise. We
+		// loop back around either way, so we always stop through the check above.
+		if cc != nil && cc.meta != nil && !js.metaRecovering && cc.isLeader() {
+			js.reconcilePeerAssignments(peers)
+		}
+		js.mu.Unlock()
 	}
 }
 
@@ -2823,6 +2928,11 @@ func (js *jetStream) processRemovePeer(peer string) {
 	if js == nil || js.disabled.Load() {
 		return
 	}
+
+	// It's leaving the meta group, so stop waiting for its first STATSZ.
+	js.prMu.Lock()
+	delete(js.prNewPeers, peer)
+	js.prMu.Unlock()
 
 	js.mu.Lock()
 	s, cc := js.srv, js.cluster
@@ -6825,6 +6935,11 @@ func (js *jetStream) consumerAssignmentOrInflight(account, stream, consumer stri
 // Will gather all consumer assignments for the specified account and stream, both applied and inflight assignments.
 // Lock should be held.
 func (js *jetStream) consumerAssignmentsOrInflightSeq(account, stream string) iter.Seq[*consumerAssignment] {
+	return js.consumerAssignmentsOrInflightSeqFor(account, stream, nil)
+}
+
+// Lock should be held.
+func (js *jetStream) consumerAssignmentsOrInflightSeqFor(account string, stream string, sa *streamAssignment) iter.Seq[*consumerAssignment] {
 	return func(yield func(*consumerAssignment) bool) {
 		cc := js.cluster
 		if cc == nil {
@@ -6840,9 +6955,10 @@ func (js *jetStream) consumerAssignmentsOrInflightSeq(account, stream string) it
 				return
 			}
 		}
-		sa := js.streamAssignment(account, stream)
 		if sa == nil {
-			return
+			if sa = js.streamAssignment(account, stream); sa == nil {
+				return
+			}
 		}
 		for _, ca := range sa.consumers {
 			// Skip if we already iterated over it as inflight.
@@ -8523,6 +8639,80 @@ func (js *jetStream) processLeaderChange(isLeader bool, term uint64) {
 		// Clear check.
 		cc.streamsCheck = false
 	}
+
+	// Reconcile assignments for missing or stale peers, for all peers.
+	js.seedNewPeers(isLeader)
+	if isLeader {
+		js.reconcilePeerAssignments(nil)
+	}
+}
+
+// Reconciles stream and consumer assignments with missing peers, or peers that have since
+// been removed from the meta peer set.
+// Lock should be held.
+func (js *jetStream) reconcilePeerAssignments(peers map[string]struct{}) {
+	cc := js.cluster
+	if cc == nil || cc.meta == nil {
+		return
+	}
+
+	// The meta peer set as we know it right now.
+	mp := cc.meta.Peers()
+	metaPeers := make(map[string]struct{}, len(mp))
+	for _, p := range mp {
+		metaPeers[p.ID] = struct{}{}
+	}
+
+	// If peers are specified, they're the only ones eligible for addition.
+	var ignore []string
+	if len(peers) > 0 {
+		var eligible bool
+		ignore = make([]string, 0, len(mp))
+		for _, p := range mp {
+			if _, ok := peers[p.ID]; ok {
+				eligible = true
+			} else {
+				ignore = append(ignore, p.ID)
+			}
+		}
+		// None of them have joined the meta group yet, for example when a statsz
+		// fires before the peer joins. Nothing to do.
+		if !eligible {
+			return
+		}
+	}
+
+	for accName, sa := range js.streamAssignmentsOrInflightSeqAllAccounts() {
+		if sa.unsupported != nil {
+			continue
+		}
+
+		// Remove any stale meta peers, and add missing.
+		if stale := sa.Group.stalePeers(metaPeers); len(stale) > 0 || sa.missingPeers() {
+			if nsa, _ := cc.reassignStreamPeers(sa, stale, true, sa.Config.Replicas, ignore...); nsa != nil {
+				sa = nsa
+				if err := cc.meta.Propose(cc.term, encodeAddStreamAssignment(sa)); err != nil {
+					return
+				}
+				cc.trackInflightStreamProposal(accName, nsa, false)
+			}
+		}
+
+		// Now do the same for consumers.
+		consumers, deleted, _ := js.remapConsumerAssignments(accName, sa)
+		for _, ca := range consumers {
+			if err := cc.meta.Propose(cc.term, encodeAddConsumerAssignment(ca)); err != nil {
+				return
+			}
+			cc.trackInflightConsumerProposal(accName, sa.Config.Name, ca, false)
+		}
+		for _, ca := range deleted {
+			if err := cc.meta.Propose(cc.term, encodeDeleteConsumerAssignment(ca)); err != nil {
+				return
+			}
+			cc.trackInflightConsumerProposal(accName, sa.Config.Name, ca, true)
+		}
+	}
 }
 
 // Lock should be held.
@@ -8530,7 +8720,15 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, peer str
 	if !sa.Group.isMember(peer) && (sa.Group.Desired == nil || !slices.Contains(sa.Group.Desired.Peers, peer)) {
 		return nil, false
 	}
+	return cc.reassignStreamPeers(sa, []string{peer}, remove, 0)
+}
 
+// Replaces the given peers in the group, growing it toward minReplicas if it's smaller.
+// If remove is set they're dropped right away, otherwise the group migrates off them.
+// Ignored peers are kept out of placement, but stay if already in the group.
+// Returns nil if the peer set is unchanged or empty, replaced if all peers got a replacement.
+// Lock should be held.
+func (cc *jetStreamCluster) reassignStreamPeers(sa *streamAssignment, peers []string, remove bool, minReplicas int, ignore ...string) (csa *streamAssignment, replaced bool) {
 	// If the group is already converging toward a desired peer set, that set is what
 	// actually drives membership, so base the replacement on it. Otherwise we'd hand back
 	// a peer set that the in-flight migration reconciles right back over.
@@ -8539,25 +8737,29 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, peer str
 		basePeers, baseCluster = d.Peers, d.Cluster
 	}
 
-	// Invoke placement algo passing RG peers that stay (existing) and the peer that is being removed (ignore)
-	retain, ignore := make([]string, 0, len(basePeers)), []string{peer}
+	// Invoke placement algo passing RG peers that stay (existing) and those being removed (ignore).
+	retain := make([]string, 0, len(basePeers))
 	for _, v := range basePeers {
-		if v != peer {
+		if !slices.Contains(peers, v) {
 			retain = append(retain, v)
 		}
 	}
-
-	removeFrom := func(peers []string) []string {
-		for i, p := range peers {
-			if p == peer {
-				peers[i] = peers[len(peers)-1]
-				return peers[:len(peers)-1]
-			}
-		}
-		return peers
+	skip := peers
+	if len(ignore) > 0 {
+		skip = slices.Concat(peers, ignore)
 	}
-
-	newPeers, placementError := cc.selectPeerGroup(len(basePeers), baseCluster, sa.Config, retain, 0, ignore)
+	// Placement is all-or-nothing, so if we can't add every peer we're missing in one
+	// go, add as many as we can and heal the remainder on a later pass. Walking down
+	// from the target means the first success is the largest group we can form.
+	target := max(len(basePeers), minReplicas)
+	var newPeers []string
+	var placementError *selectPeerError
+	for r := target; ; r-- {
+		newPeers, placementError = cc.selectPeerGroup(r, baseCluster, sa.Config, retain, 0, skip)
+		if placementError == nil || r <= len(retain)+1 {
+			break
+		}
+	}
 
 	csa = sa.copyGroup()
 	csa.Group.Cluster = baseCluster
@@ -8565,13 +8767,16 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, peer str
 		csa.Group.Peers = newPeers
 		replaced = true
 	} else {
-		csa.Group.Peers = removeFrom(copyStrings(basePeers))
+		csa.Group.Peers = retain
 	}
 	csa.Group = sa.Group.withDesired(csa.Group)
 	// Preserve how the group is meant to converge.
 	if d := sa.Group.Desired; d != nil {
 		csa.Group.Desired.ScaleDown = d.ScaleDown
 		csa.Group.Desired.ScaleUp = d.ScaleUp
+	}
+	removeFrom := func(from []string) []string {
+		return slices.DeleteFunc(from, func(p string) bool { return slices.Contains(peers, p) })
 	}
 	if remove {
 		csa.Group.Peers = removeFrom(csa.Group.Peers)
@@ -8591,6 +8796,10 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, peer str
 	if len(csa.Group.Desired.Peers) == 0 {
 		return nil, false
 	}
+	// Nothing actually changes, don't propose a no-op migration.
+	if slices.Equal(csa.Group.Peers, sa.Group.Peers) && slices.Equal(csa.Group.Desired.Peers, basePeers) {
+		return nil, false
+	}
 	// If no peers remain, immediately jump to desired set.
 	if len(csa.Group.Peers) == 0 {
 		csa.Group.Peers = csa.Group.Desired.Peers
@@ -8604,15 +8813,9 @@ func (cc *jetStreamCluster) remapStreamAssignment(sa *streamAssignment, peer str
 // peer set.
 // Lock should be held.
 func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignment) (consumers, deleted []*consumerAssignment, done bool) {
-	targetPeers := sa.Group.Peers
-	if sa.Group.Desired != nil {
-		targetPeers = sa.Group.Desired.Peers
-	} else if len(targetPeers) > sa.Config.Replicas {
-		// If the stream is already moving, without desired state, the last N peers are the target.
-		targetPeers = targetPeers[len(targetPeers)-sa.Config.Replicas:]
-	}
+	targetPeers := sa.targetPeers()
 	done = true
-	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
+	for ca := range js.consumerAssignmentsOrInflightSeqFor(accName, sa.Config.Name, sa) {
 		if ca.Config == nil || ca.unsupported != nil {
 			continue
 		}
@@ -8628,12 +8831,29 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 		if sa.Config.Retention != LimitsPolicy {
 			r = sa.Config.Replicas
 		}
-		// Drop peers that are no longer part of the stream. If moving, the tail MUST be the new peer set.
-		var newPeers []string
+		// Perform a quick check, without allocating, whether this consumer needs to be remapped.
 		kept := 0
 		for _, p := range consumerPeers {
 			if slices.Contains(targetPeers, p) {
 				kept++
+			}
+		}
+		// Backfill can only draw from the target peer set, so that bounds how far we can grow.
+		size := kept
+		if size < r {
+			size = min(r, max(kept, len(targetPeers)))
+		} else if size > r {
+			size = r
+		}
+		// Leave the consumer alone if its peer set is unaffected.
+		if kept == len(consumerPeers) && kept == size {
+			continue
+		}
+
+		// Drop peers that are no longer part of the stream. If moving, the tail MUST be the new peer set.
+		newPeers := make([]string, 0, max(kept, size))
+		for _, p := range consumerPeers {
+			if slices.Contains(targetPeers, p) {
 				newPeers = append(newPeers, p)
 			}
 		}
@@ -8651,10 +8871,6 @@ func (js *jetStream) remapConsumerAssignments(accName string, sa *streamAssignme
 			}
 		} else if len(newPeers) > r {
 			newPeers = newPeers[:r]
-		}
-		// Leave the consumer alone if its peer set is unaffected.
-		if kept == len(consumerPeers) && len(newPeers) == len(consumerPeers) {
-			continue
 		}
 		cca := ca.copyGroup()
 		// Adjust preferred as needed.
@@ -8944,7 +9160,7 @@ func (cc *jetStreamCluster) selectPeerGroup(r int, cluster string, cfg *StreamCo
 		}
 
 		// If we've never heard from a server, don't consider.
-		if ni.cfg == nil || ni.stats == nil {
+		if !ni.selectable() {
 			s.Debugf("Peer selection: discard %s@%s reason: offline", ni.name, ni.cluster)
 			err.offline = true
 			continue
