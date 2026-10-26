@@ -204,6 +204,8 @@ type jsaUsage struct {
 
 // EnableJetStream will enable JetStream support on this server with the given configuration.
 // A nil configuration will dynamically choose the limits and temporary file storage directory.
+// That directory is a fixed path ($TMPDIR/nats/jetstream) shared by every server on the
+// host, so pass an explicit StoreDir (e.g. t.TempDir() in tests) to keep instances isolated.
 func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 	if s.JetStreamEnabled() {
 		return fmt.Errorf("jetstream already enabled")
