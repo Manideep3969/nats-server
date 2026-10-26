@@ -440,13 +440,14 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 				}
 			}
 			c.mu.Unlock()
-			openClients = oc
 		}
+		openClients = oc
 	}
 
 	// Just return with empty array if nothing here.
 	if len(openClients) == 0 && len(closedClients) == 0 {
 		c.Conns = ConnInfos{}
+		c.Total = 0
 		return c, nil
 	}
 
@@ -535,6 +536,9 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		pconns = pconns[:i]
 		totalClients = i
 	}
+	// The total must reflect the applied filters, not the server total, so that
+	// clients can paginate correctly.
+	c.Total = totalClients
 
 	switch sortOpt {
 	case ByCid, ByStart:

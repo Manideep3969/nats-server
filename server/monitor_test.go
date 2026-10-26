@@ -705,6 +705,89 @@ func TestMonitorConnzWithCIDAndAccountFilter(t *testing.T) {
 	checkConns(t, sysReq(t, ncB, cidA), 0, 0)
 }
 
+func TestMonitorConnzTotalWithFilters(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			A {
+				users = [
+					{ user: alice, password: pwd }
+					{ user: bob, password: pwd }
+				]
+			}
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncAlice, err := nats.Connect(s.ClientURL(), nats.UserInfo("alice", "pwd"))
+	require_NoError(t, err)
+	defer ncAlice.Close()
+	_, err = ncAlice.SubscribeSync("bar")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("bob", "pwd"))
+		require_NoError(t, err)
+		defer nc.Close()
+		_, err = nc.SubscribeSync("foo")
+		require_NoError(t, err)
+	}
+
+	// Wait for the connections and subscriptions to be processed.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		cz, err := s.Connz(&ConnzOptions{Account: "A", FilterSubject: "foo"})
+		if err != nil {
+			return err
+		}
+		if len(cz.Conns) != 3 {
+			return fmt.Errorf("expected 3 matching connections, got %d", len(cz.Conns))
+		}
+		return nil
+	})
+
+	for _, test := range []struct {
+		name     string
+		opts     *ConnzOptions
+		total    int
+		numConns int
+	}{
+		{"user match", &ConnzOptions{User: "alice"}, 1, 1},
+		{"user no match", &ConnzOptions{User: "nobody"}, 0, 0},
+		{"user paginated", &ConnzOptions{User: "bob", Limit: 1}, 3, 1},
+		{"subject match", &ConnzOptions{Account: "A", FilterSubject: "foo"}, 3, 3},
+		{"subject no match", &ConnzOptions{Account: "A", FilterSubject: "nope"}, 0, 0},
+		{"account match", &ConnzOptions{Account: "A"}, 4, 4},
+		{"account no match", &ConnzOptions{Account: "B"}, 0, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cz, err := s.Connz(test.opts)
+			require_NoError(t, err)
+			require_Equal(t, cz.Total, test.total)
+			require_Len(t, len(cz.Conns), test.numConns)
+		})
+	}
+
+	// Closed connections must honor the filters in the total as well.
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("bob", "pwd"))
+	require_NoError(t, err)
+	nc.Close()
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		cz, err := s.Connz(&ConnzOptions{State: ConnClosed, User: "bob"})
+		if err != nil {
+			return err
+		}
+		if cz.Total != 1 || len(cz.Conns) != 1 {
+			return fmt.Errorf("expected 1 closed bob connection, got total=%d conns=%d", cz.Total, len(cz.Conns))
+		}
+		return nil
+	})
+	cz, err := s.Connz(&ConnzOptions{State: ConnClosed, User: "alice"})
+	require_NoError(t, err)
+	require_Equal(t, cz.Total, 0)
+	require_Len(t, len(cz.Conns), 0)
+}
+
 // Helper to map to connection name
 func createConnMap(cz *Connz) map[string]*ConnInfo {
 	cm := make(map[string]*ConnInfo)
