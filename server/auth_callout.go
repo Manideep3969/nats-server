@@ -208,6 +208,9 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 				return 0, nil, fmt.Errorf("authorized user on account %q using invalid connection type", account)
 			}
 		}
+		if !c.connectionTypeAllowed(allowedConnTypes) {
+			return 0, nil, fmt.Errorf("authorized user on account %q not allowed to use connection type", account)
+		}
 		return expiration, allowedConnTypes, nil
 	}
 
@@ -283,14 +286,15 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
-		expiration, allowedConnTypes, err := getExpirationAndAllowedConnections(arc, racc.Name)
+		targetAcc, err := assignAccountAndPermissions(arc, racc.Name)
 		if err != nil {
 			c.authViolation()
 			respCh <- titleCase(err.Error())
 			return
 		}
 
-		targetAcc, err := assignAccountAndPermissions(arc, racc.Name)
+		// Checked after the scoped template, which may restrict connection types.
+		expiration, allowedConnTypes, err := getExpirationAndAllowedConnections(arc, racc.Name)
 		if err != nil {
 			c.authViolation()
 			respCh <- titleCase(err.Error())
@@ -332,6 +336,9 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
 		}
+		// Carry the user's tags and name onto the client, as with regular JWT auth.
+		c.tags = arc.Tags
+		c.nameTag = arc.Name
 		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.

@@ -52,6 +52,46 @@ import (
 	"github.com/nats-io/nuid"
 )
 
+func TestJetStreamLameDuckGracePeriod(t *testing.T) {
+	o := DefaultOptions()
+	o.Cluster = ClusterOpts{}
+	o.JetStream = true
+	o.StoreDir = t.TempDir()
+	testSetLDMGracePeriod(o, 5*time.Second)
+	o.LameDuckDuration = 50 * time.Millisecond
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	ldm := make(chan struct{}, 1)
+	nc, js := jsClientConnect(t, s, nats.NoReconnect(), nats.LameDuckModeHandler(func(_ *nats.Conn) {
+		ldm <- struct{}{}
+	}))
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		s.LameDuckShutdown()
+		close(done)
+	}()
+	select {
+	case <-ldm:
+	case <-time.After(3 * time.Second):
+		t.Fatal("did not receive lame-duck INFO")
+	}
+
+	_, err = js.Publish("foo", []byte("during grace period"))
+	require_NoError(t, err)
+
+	s.Shutdown()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lame-duck shutdown did not complete")
+	}
+}
+
 func TestJetStreamBasicNilConfig(t *testing.T) {
 	s := RunRandClientPortServer(t)
 	defer s.Shutdown()
@@ -27347,4 +27387,342 @@ func TestJetStreamInterestCheckWithoutConsumersDoesNotCompact(t *testing.T) {
 	require_Equal(t, state.Msgs, numMsgs)
 	require_Equal(t, state.FirstSeq, 1)
 	require_Equal(t, state.LastSeq, numMsgs)
+}
+
+func TestJetStreamInterestCheckZeroCheckFloorDoesNotPurge(t *testing.T) {
+	for _, st := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Subjects:  []string{"foo"},
+				Storage:   st,
+				Retention: nats.InterestPolicy,
+			})
+			require_NoError(t, err)
+
+			// Acks a prefix and still holds interest in every message after it.
+			sub, err := js.PullSubscribe("foo", "lagging")
+			require_NoError(t, err)
+
+			const numMsgs, numAcked = 100, 10
+			for range numMsgs {
+				_, err = js.Publish("foo", nil)
+				require_NoError(t, err)
+			}
+			for _, m := range fetchMsgs(t, sub, numAcked, 5*time.Second) {
+				require_NoError(t, m.AckSync())
+			}
+
+			// Closing while the check runs, before it ever completed a check,
+			// so its check returns early and leaves its check floor at 0.
+			_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+				Durable:       "closing",
+				AckPolicy:     nats.AckNonePolicy,
+				DeliverPolicy: nats.DeliverNewPolicy,
+			})
+			require_NoError(t, err)
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			o := mset.lookupConsumer("closing")
+			require_NotNil(t, o)
+			o.mu.Lock()
+			o.closed = true
+			o.mu.Unlock()
+
+			// A zero check floor must not compact the stream. Only the acked
+			// prefix is gone, the lagging consumer still needs the rest.
+			mset.checkInterestState()
+			o.mu.Lock()
+			o.closed = false
+			o.mu.Unlock()
+			state := mset.state()
+			require_Equal(t, state.Msgs, numMsgs-numAcked)
+			require_Equal(t, state.FirstSeq, numAcked+1)
+			require_Equal(t, state.LastSeq, numMsgs)
+		})
+	}
+}
+
+func TestJetStreamInterestCheckConsumerAheadOfStreamCompacts(t *testing.T) {
+	for _, st := range []nats.StorageType{nats.FileStorage, nats.MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:      "TEST",
+				Subjects:  []string{"foo"},
+				Storage:   st,
+				Retention: nats.InterestPolicy,
+			})
+			require_NoError(t, err)
+
+			// Starts past the stream's last sequence, so it has no interest in
+			// any message in the stream.
+			const numMsgs = 100
+			_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+				Durable:       "ahead",
+				AckPolicy:     nats.AckNonePolicy,
+				DeliverPolicy: nats.DeliverByStartSequencePolicy,
+				OptStartSeq:   numMsgs + 10,
+			})
+			require_NoError(t, err)
+
+			mset, err := s.GlobalAccount().lookupStream("TEST")
+			require_NoError(t, err)
+			for range numMsgs {
+				_, _, err = mset.store.StoreMsg("foo", nil, []byte("msg"), 0)
+				require_NoError(t, err)
+			}
+
+			// No consumer has interest in these messages, so they are removed.
+			mset.checkInterestState()
+			state := mset.state()
+			require_Equal(t, state.Msgs, 0)
+			require_Equal(t, state.FirstSeq, numMsgs+1)
+			require_Equal(t, state.LastSeq, numMsgs)
+		})
+	}
+}
+
+func TestJetStreamConcurrentEnableAndCreateFileStream(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		accName := fmt.Sprintf("ACC_%d", i)
+		acc, _ := s.LookupOrRegisterAccount(accName)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var enableErr error
+		go func() {
+			defer wg.Done()
+			enableErr = acc.EnableJetStream(nil, nil)
+		}()
+
+		var streamErr error
+		go func() {
+			defer wg.Done()
+			for range 500 {
+				_, streamErr = acc.addStream(&StreamConfig{
+					Name:     "S0",
+					Subjects: []string{"s0.>"},
+					Storage:  FileStorage,
+				})
+				if streamErr == nil || !IsNatsErr(streamErr, JSNotEnabledForAccountErr) {
+					break
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}()
+
+		wg.Wait()
+		require_NoError(t, enableErr)
+		require_NoError(t, streamErr)
+	}
+}
+
+func TestJetStreamEnableAccountStorageDirFailure(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupOrRegisterAccount("ACC_FAIL")
+
+	// Place a file where the account's storage directory should go, so that
+	// creating the streams directory fails.
+	accDir := filepath.Join(s.JetStreamConfig().StoreDir, "ACC_FAIL")
+	require_NoError(t, os.WriteFile(accDir, []byte("x"), 0600))
+
+	// Enabling must fail and must not leave the account half enabled.
+	require_Error(t, acc.EnableJetStream(nil, nil))
+	require_False(t, acc.JetStreamEnabled())
+	require_Equal(t, s.JetStreamNumAccounts(), 1) // Only the global account.
+
+	// Once the problem is gone, a retry succeeds.
+	require_NoError(t, os.Remove(accDir))
+	require_NoError(t, acc.EnableJetStream(nil, nil))
+	require_True(t, acc.JetStreamEnabled())
+}
+
+// https://github.com/nats-io/nats-server/issues/8725
+func TestJetStreamDeleteStreamPreservesAccountDirectories(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"test"},
+		Storage:  nats.FileStorage,
+	}
+	_, err := js.AddStream(cfg)
+	require_NoError(t, err)
+
+	accDir := filepath.Join(s.JetStreamConfig().StoreDir, globalAccountName)
+	sdir := filepath.Join(accDir, streamsDir)
+
+	_, err = os.Stat(sdir)
+	require_NoError(t, err)
+
+	require_NoError(t, js.DeleteStream("TEST"))
+
+	// Allow any asynchronous cleanup goroutines time to run.
+	time.Sleep(50 * time.Millisecond)
+
+	// Streams and account directories must not be removed when deleting
+	// the last stream; they belong to the account lifecycle.
+	_, err = os.Stat(sdir)
+	require_NoError(t, err)
+	_, err = os.Stat(accDir)
+	require_NoError(t, err)
+
+	// Recreating the stream in the account must succeed immediately.
+	_, err = js.AddStream(cfg)
+	require_NoError(t, err)
+}
+
+func TestJetStreamConcurrentDeleteAndCreateStream(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	const (
+		name1 = "S1"
+		name2 = "S2"
+	)
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     name1,
+		Subjects: []string{"s1"},
+		Storage:  nats.FileStorage,
+	})
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var delErr, createErr error
+	start := make(chan struct{})
+
+	go func() {
+		defer wg.Done()
+		<-start
+		delErr = js.DeleteStream(name1)
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-start
+		_, createErr = js.AddStream(&nats.StreamConfig{
+			Name:     name2,
+			Subjects: []string{"s2"},
+			Storage:  nats.FileStorage,
+		})
+	}()
+
+	close(start)
+	wg.Wait()
+
+	require_NoError(t, delErr)
+	require_NoError(t, createErr)
+
+	require_NoError(t, js.DeleteStream(name2))
+}
+
+// All sources share one inbound queue. A message rejected for one source must not
+// drop the messages of other sources behind it, or those get their consumer recreated too.
+func TestJetStreamSourceRejectedMsgKeepsRestOfBatch(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	for _, name := range []string{"A", "B"} {
+		_, err := js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{name}})
+		require_NoError(t, err)
+	}
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:    "S",
+		Sources: []*nats.StreamSource{{Name: "A"}, {Name: "B"}},
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("S")
+	require_NoError(t, err)
+
+	checkMsgs := func(want uint64) {
+		t.Helper()
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			if n := mset.state().Msgs; n != want {
+				return fmt.Errorf("expected %d messages, got %d", want, n)
+			}
+			return nil
+		})
+	}
+
+	// Wait for both source consumers to deliver.
+	for _, subj := range []string{"A", "B"} {
+		_, err = js.Publish(subj, nil)
+		require_NoError(t, err)
+	}
+	checkMsgs(2)
+
+	// Hold the stream lock so the queued messages below are popped as one batch.
+	mset.mu.Lock()
+	unlock := sync.OnceFunc(mset.mu.Unlock)
+	defer unlock()
+	siA, siB, msgs := mset.sources["A > >"], mset.sources["B > >"], mset.smsgs
+	require_NotNil(t, siA)
+	require_NotNil(t, siB)
+	cname := siB.cname
+
+	checkQueued := func(want int) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := msgs.len(); n != want {
+				return fmt.Errorf("expected %d queued, got %d", want, n)
+			}
+			return nil
+		})
+	}
+	queueA := func(sseq, dseq uint64) {
+		reply := fmt.Sprintf("$JS.ACK.A.%s.1.%d.%d.%d.0", siA.cname, sseq, dseq, time.Now().UnixNano())
+		mset.queueInbound(msgs, "A", reply, nil, nil, siA, nil)
+	}
+
+	// Queue an already stored message. Once popped, the source goroutine blocks on the lock.
+	queueA(siA.sseq, siA.dseq)
+	checkQueued(0)
+
+	// A message for A with a delivery gap, then two for B, all left in the queue.
+	queueA(siA.sseq+1, siA.dseq+2)
+	for range 2 {
+		_, err = js.Publish("B", nil)
+		require_NoError(t, err)
+	}
+	checkQueued(3)
+	unlock()
+
+	// Both messages for B are stored without recreating its consumer.
+	checkMsgs(4)
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	require_Equal(t, siB.cname, cname)
 }

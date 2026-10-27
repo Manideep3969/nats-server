@@ -704,6 +704,46 @@ func (fs *fileStore) resetDurabilitySettingsLocked() {
 	fs.updateDurabilitySettingsLocked(fs.cfg.Replicas > 1)
 }
 
+// updateAsyncFlushLocked enables or disables async flush based on replication and persist mode.
+// Lock should be held.
+func (fs *fileStore) updateAsyncFlushLocked() error {
+	lmb := fs.lmb
+	if lmb == nil {
+		return nil
+	}
+	// Enable/disable async flush depending on if it's supported and already initialized.
+	supportsAsyncFlush := !fs.fcfg.SyncAlways && fs.cfg.Replicas > 1
+
+	// Async persist mode opts in to async flushing,
+	// sync always would also be disabled if it was configured.
+	if fs.cfg.PersistMode == AsyncPersistMode {
+		supportsAsyncFlush = true
+		fs.fcfg.SyncAlways = false
+		fs.syncAlways.Store(false)
+	}
+
+	if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
+		fs.fcfg.AsyncFlush = true
+		lmb.spinUpFlushLoop()
+	} else if !supportsAsyncFlush && fs.fcfg.AsyncFlush {
+		fs.fcfg.AsyncFlush = false
+		lmb.mu.Lock()
+		// Quit the flush loop.
+		if lmb.qch != nil {
+			close(lmb.qch)
+			lmb.qch = nil
+		}
+		_, err := lmb.flushPendingMsgsLocked()
+		lmb.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	// Set flush in place to AsyncFlush which by default is false.
+	fs.fip = !fs.fcfg.AsyncFlush
+	return nil
+}
+
 // flushForScaleDown transitions a SyncOnFlush store back to SyncAlways.
 func (fs *fileStore) flushForScaleDown() error {
 	fs.mu.Lock()
@@ -797,39 +837,9 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 	}
 
 	fs.resetDurabilitySettingsLocked()
-
-	if lmb := fs.lmb; lmb != nil {
-		// Enable/disable async flush depending on if it's supported and already initialized.
-		supportsAsyncFlush := !fs.fcfg.SyncAlways && cfg.Replicas > 1
-
-		// Async persist mode opts in to async flushing,
-		// sync always would also be disabled if it was configured.
-		if cfg.PersistMode == AsyncPersistMode {
-			supportsAsyncFlush = true
-			fs.fcfg.SyncAlways = false
-			fs.syncAlways.Store(false)
-		}
-
-		if supportsAsyncFlush && !fs.fcfg.AsyncFlush {
-			fs.fcfg.AsyncFlush = true
-			lmb.spinUpFlushLoop()
-		} else if !supportsAsyncFlush && fs.fcfg.AsyncFlush {
-			fs.fcfg.AsyncFlush = false
-			lmb.mu.Lock()
-			// Quit the flush loop.
-			if lmb.qch != nil {
-				close(lmb.qch)
-				lmb.qch = nil
-			}
-			_, err := lmb.flushPendingMsgsLocked()
-			lmb.mu.Unlock()
-			if err != nil {
-				fs.mu.Unlock()
-				return err
-			}
-		}
-		// Set flush in place to AsyncFlush which by default is false.
-		fs.fip = !fs.fcfg.AsyncFlush
+	if err := fs.updateAsyncFlushLocked(); err != nil {
+		fs.mu.Unlock()
+		return err
 	}
 	fs.mu.Unlock()
 
@@ -2057,15 +2067,24 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	setTime(&state.LastTime, readI64())
 
 	// Check for per subject info.
-	if numSubjects := int(readU64()); numSubjects > 0 {
+	numSubjects := readU64()
+	// Each subject takes at least one byte, so the count can't exceed the remaining length.
+	if bi < 0 || numSubjects > uint64(len(buf)-bi) {
+		_ = os.Remove(fn)
+		fs.warn("Stream state bad subject count (%d)", numSubjects)
+		return errCorruptState
+	}
+	if numSubjects > 0 {
 		fs.psim, fs.tsl = fs.psim.Empty(), 0
-		for i := 0; i < numSubjects; i++ {
-			if lsubj := int(readU64()); lsubj > 0 {
-				if bi+lsubj > len(buf) {
-					_ = os.Remove(fn)
-					fs.warn("Stream state bad subject len (%d)", lsubj)
-					return errCorruptState
-				}
+		for i := uint64(0); i < numSubjects; i++ {
+			// Compare against the remaining length so a large subject length can't overflow.
+			n := readU64()
+			if bi < 0 || n > uint64(len(buf)-bi) {
+				_ = os.Remove(fn)
+				fs.warn("Stream state bad subject len (%d)", n)
+				return errCorruptState
+			}
+			if lsubj := int(n); lsubj > 0 {
 				// If we have lots of subjects this will alloc for each one.
 				// We could reference the underlying buffer, but we could guess wrong if
 				// number of blocks is large and subjects is low, since we would reference buf.
@@ -2093,7 +2112,14 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	// Track the state as represented by the blocks themselves.
 	var mstate StreamState
 
-	if numBlocks := readU64(); numBlocks > 0 {
+	numBlocks := readU64()
+	// Each block takes at least one byte, so the count can't exceed the remaining length.
+	if bi < 0 || numBlocks > uint64(len(buf)-bi) {
+		_ = os.Remove(fn)
+		fs.warn("Stream state bad block count (%d)", numBlocks)
+		return errCorruptState
+	}
+	if numBlocks > 0 {
 		lastIndex := int(numBlocks - 1)
 		fs.blks = make([]*msgBlock, 0, numBlocks)
 		for i := 0; i < int(numBlocks); i++ {
@@ -3043,113 +3069,69 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 	if seq := atomic.LoadUint64(&mb.first.seq); seq > start {
 		start = seq
 	}
+
+	fseq := start
 	lseq := atomic.LoadUint64(&mb.last.seq)
 
 	// If the FSS state has fewer entries than sequences in the linear scan,
 	// then use intersection instead as likely going to be cheaper. This will
 	// often be the case with high numbers of deletes, as well as a smaller
 	// number of subjects in the block.
-	if uint64(mb.fss.Size()) < lseq-start {
+	useIndex := uint64(mb.fss.Size()) < lseq-start
+	if useIndex {
 		// If there are no subject matches then this is effectively no-op.
-		hseq := uint64(math.MaxUint64)
+		fseq = uint64(math.MaxUint64)
 		var ierr error
 		stree.IntersectGSL(mb.fss, sl, func(subj []byte, ss *SimpleState) bool {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
-				// mb is already loaded into the cache so should be fast-ish.
 				if ierr = mb.recalculateForSubj(bytesToString(subj), ss); ierr != nil {
 					return false
 				}
 			}
-			first := max(start, ss.First)
-			if first > ss.Last || first >= hseq {
-				// The start cutoff is after the last sequence for this subject,
-				// or we think we already know of a subject with an earlier msg
-				// than our first seq for this subject.
-				return true
+			if start <= ss.Last {
+				fseq = min(fseq, max(start, ss.First))
 			}
-			// Need messages loaded from here on out.
-			if mb.cacheNotLoaded() {
-				if ierr = mb.loadMsgsWithLock(); ierr != nil {
-					return false
-				}
-				didLoad = true
-			}
-			if sm == nil {
-				sm = new(StoreMsg)
-			}
-			if first == ss.First {
-				// If the start floor is below where this subject starts then we can
-				// short-circuit, avoiding needing to scan for the next message.
-				if fsm, err := mb.cacheLookup(ss.First, sm); err == nil {
-					sm = fsm
-					hseq = ss.First
-				}
-				return true
-			}
-			for seq := first; seq <= ss.Last; seq++ {
-				// Otherwise we have a start floor that intersects where this subject
-				// has messages in the block, so we need to walk up until we find a
-				// message matching the subject.
-				if mb.dmap.Exists(seq) {
-					// Optimisation to avoid calling cacheLookup which hits time.Now().
-					// Instead we will update it only once in a defer.
-					updateLLTS = true
-					continue
-				}
-				llseq := mb.llseq
-				fsm, err := mb.cacheLookup(seq, sm)
-				if err != nil {
-					continue
-				}
-				updateLLTS = false // cacheLookup already updated it.
-				if sl.HasInterest(fsm.subj) {
-					hseq = seq
-					sm = fsm
-					break
-				}
-				// If we are here we did not match, so put the llseq back.
-				mb.llseq = llseq
-			}
-			return true
+			// No candidate can precede the requested starting sequence.
+			return fseq != start
 		})
 		if ierr != nil {
 			return nil, false, ierr
 		}
-		if hseq < uint64(math.MaxUint64) && sm != nil {
-			return sm, didLoad && start == lseq, nil
+		if fseq == uint64(math.MaxUint64) {
+			return nil, didLoad, ErrStoreMsgNotFound
 		}
-	} else {
-		// Need messages loaded from here on out.
-		if mb.cacheNotLoaded() {
-			if err := mb.loadMsgsWithLock(); err != nil {
-				return nil, false, err
-			}
-			didLoad = true
-		}
-		if sm == nil {
-			sm = new(StoreMsg)
-		}
+	}
 
-		for seq := start; seq <= lseq; seq++ {
-			if mb.dmap.Exists(seq) {
-				// Optimisation to avoid calling cacheLookup which hits time.Now().
-				// Instead we will update it only once in a defer.
-				updateLLTS = true
-				continue
-			}
-			llseq := mb.llseq
-			fsm, err := mb.cacheLookup(seq, sm)
-			if err != nil {
-				continue
-			}
-			expireOk := seq == lseq && mb.llseq != llseq && mb.llseq == seq
-			updateLLTS = false // cacheLookup already updated it.
-			if sl.HasInterest(fsm.subj) {
-				return fsm, expireOk, nil
-			}
-			// If we are here we did not match, so put the llseq back.
-			mb.llseq = llseq
+	// Need messages loaded from here on out.
+	if mb.cacheNotLoaded() {
+		if err := mb.loadMsgsWithLock(); err != nil {
+			return nil, false, err
 		}
+		didLoad = true
+	}
+	if sm == nil {
+		sm = new(StoreMsg)
+	}
+
+	for seq := fseq; seq <= lseq; seq++ {
+		if mb.dmap.Exists(seq) {
+			// Optimisation to avoid calling cacheLookup which hits time.Now().
+			// Instead we will update it only once in a defer.
+			updateLLTS = true
+			continue
+		}
+		llseq := mb.llseq
+		fsm, err := mb.cacheLookup(seq, sm)
+		if err != nil {
+			continue
+		}
+		expireOk := !useIndex && seq == lseq && mb.llseq != llseq && mb.llseq == seq
+		updateLLTS = false // cacheLookup already updated it.
+		if sl.HasInterest(fsm.subj) {
+			return fsm, expireOk, nil
+		}
+		// If we are here we did not match, so put the llseq back.
+		mb.llseq = llseq
 	}
 
 	return nil, didLoad, ErrStoreMsgNotFound
@@ -4044,30 +4026,21 @@ func (fs *fileStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAll
 		return nil, nil
 	}
 
-	// Grab our last mb index (not same as blk index).
-	lastMB.mu.RLock()
-	lastMBIndex := lastMB.index
-	lastMB.mu.RUnlock()
-
+	// Find a starting point for the backward scan over matching subjects.
 	subs := make(map[string]*psi)
-	var numLess int
 	var maxBlk uint32
 
 	for _, filter := range filters {
 		fs.psim.Match(stringToBytes(filter), func(subj []byte, psi *psi) {
 			subs[string(subj)] = psi
-			if psi.lblk < lastMBIndex {
-				numLess++
-				if psi.lblk > maxBlk {
-					maxBlk = psi.lblk
-				}
+			if psi.lblk > maxBlk {
+				maxBlk = psi.lblk
 			}
 		})
 	}
 
-	// If all subjects have a lower last index, select the largest for our walk backwards.
-	if numLess == len(subs) {
-		lastMB = fs.bim[maxBlk]
+	if len(subs) == 0 {
+		return nil, nil
 	}
 
 	// Collect all sequences needed.
@@ -4083,16 +4056,13 @@ func (fs *fileStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAll
 		}
 	}
 
-	for i, lnf := lastBlkIndex, false; i >= 0; i-- {
+	for i := lastBlkIndex; i >= 0; i-- {
 		if len(subs) == 0 {
 			break
 		}
 		mb := fs.blks[i]
-		if !lnf {
-			if mb != lastMB {
-				continue
-			}
-			lnf = true
+		if mb.index > maxBlk {
+			continue
 		}
 		// We can start properly looking here.
 		mb.mu.Lock()
@@ -12872,6 +12842,7 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// Unregister from the access time service.
 	ats.Unregister()
 
+	fs.debug("Stopped")
 	return nil
 }
 

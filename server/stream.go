@@ -1670,7 +1670,7 @@ func (mset *stream) rebuildDedupe() {
 // Raft log for replaying the tail of stream during
 // recovery.
 func (mset *stream) shouldReplayFromWAL() bool {
-	if mset == nil || mset.raftNode() == nil || mset.store.Type() != FileStorage {
+	if mset == nil || !mset.IsClustered() || mset.store.Type() != FileStorage {
 		return false
 	}
 	fs, ok := mset.store.(*fileStore)
@@ -3615,11 +3615,11 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	}
 
 	s, js, stype := mset.srv, mset.js, mset.cfg.Storage
-	node, term := mset.node, mset.term
+	isClustered, node, term := mset.isClustered(), mset.node, mset.term
 	mset.mu.Unlock()
 
 	var err error
-	if node != nil {
+	if isClustered {
 		if stype == FileStorage && isFileStoreMsgTooLarge(fileStoreMsgSize(m.subj, m.hdr, m.msg)) {
 			err = ErrMsgTooLarge
 		} else if js.limitsExceeded(stype) {
@@ -3694,17 +3694,16 @@ func (mset *stream) retryMirrorConsumer() error {
 
 // Lock should be held.
 func (mset *stream) skipMsgs(start, end uint64) error {
-	node, store := mset.node, mset.store
 	// If we are not clustered we can short circuit now with store.SkipMsgs
-	if node == nil {
-		if err := store.SkipMsgs(start, end-start+1); err != nil {
+	if !mset.isClustered() {
+		if err := mset.store.SkipMsgs(start, end-start+1); err != nil {
 			return err
 		}
 		mset.lseq = end
 		return nil
 	}
 	// Send a single deleteRangeOp for the full range.
-	return node.Propose(mset.term, encodeDeleteRange(&DeleteRange{First: start, Num: end - start + 1}))
+	return mset.node.Propose(mset.term, encodeDeleteRange(&DeleteRange{First: start, Num: end - start + 1}))
 }
 
 const (
@@ -4723,7 +4722,7 @@ func (mset *stream) processAllSourceMsgs() {
 						cleanUp()
 						return
 					}
-					break
+					// The batch holds messages from all sources, so only skip this one.
 				}
 				im.returnToPool()
 			}
@@ -4928,7 +4927,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 	}
 	// Receiving messages means we are not stalled on flow control.
 	mset.clearStalledFlowControl(si)
-	node, ident := mset.node, si.ident
+	isClustered, ident := mset.isClustered(), si.ident
 	mset.mu.Unlock()
 
 	hdr, msg := m.hdr, m.msg
@@ -4961,7 +4960,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 
 	var err error
 	// If we are clustered we need to propose this message to the underlying raft group.
-	if node != nil {
+	if isClustered {
 		err = mset.processClusteredInboundMsg(m.subj, _EMPTY_, hdr, msg, nil, true)
 	} else {
 		err = mset.processJetStreamMsg(m.subj, _EMPTY_, hdr, msg, 0, 0, nil, true, true)
@@ -8899,22 +8898,16 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 
 	if deleteFlag {
 		// cleanup directories after the stream
-		accDir := filepath.Join(js.config.StoreDir, accName)
 		if store != nil {
 			// Ignore errors.
 			store.Delete(false)
 		} else {
+			accDir := filepath.Join(js.config.StoreDir, accName)
 			streamDir := filepath.Join(accDir, streamsDir)
 			os.RemoveAll(filepath.Join(streamDir, name))
 		}
 		// Release any resources.
 		js.releaseStreamResources(&mset.cfg)
-		// Do cleanup in separate go routine similar to how fs will use purge here..
-		go func() {
-			// no op if not empty
-			os.Remove(filepath.Join(accDir, streamsDir))
-			os.Remove(accDir)
-		}()
 	} else if store != nil {
 		// Ignore errors.
 		store.Stop()
@@ -9024,7 +9017,8 @@ func (mset *stream) checkInterestState() {
 	mset.cfgMu.RUnlock()
 	// Remove as many messages from the "head" of the stream if there's no interest anymore.
 	// Only compact up to the current stream state, consumers may be ahead while replaying.
-	if rp == InterestPolicy && asflr != math.MaxUint64 {
+	// A check floor of 0 means a consumer has not completed a check yet, and Compact(0) purges.
+	if rp == InterestPolicy && asflr != math.MaxUint64 && asflr > 0 {
 		mset.store.Compact(min(asflr, ss.LastSeq+1))
 	}
 }

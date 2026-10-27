@@ -46,6 +46,7 @@ import (
 	"unsafe"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/minio/highwayhash"
 	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/avl"
 	"github.com/nats-io/nats-server/v2/server/gsl"
@@ -7466,6 +7467,114 @@ func TestFileStoreMultiLastSeqs(t *testing.T) {
 	seqs, err = fs.MultiLastSeqs([]string{">"}, 99, -1)
 	require_NoError(t, err)
 	checkResults(seqs, []uint64{97, 98, 99})
+
+	// No subjects match the filter.
+	seqs, err = fs.MultiLastSeqs([]string{"missing.*"}, 0, -1)
+	require_NoError(t, err)
+	checkResults(seqs, nil)
+}
+
+func TestFileStoreMultiLastSeqsDeletedBlocks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		subjects []string
+		deletes  []uint64
+		filters  []string
+		maxSeq   uint64
+		want     []uint64
+	}{
+		{
+			name:     "removed last block",
+			subjects: []string{"foo.a", "foo.b", "foo.b", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a"},
+			maxSeq:   8,
+			want:     []uint64{1},
+		},
+		{
+			name:     "multiple subjects with removed last block",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.c", "foo.c", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+		{
+			name:     "subjects with existing and removed last blocks",
+			subjects: []string{"foo.a", "foo.c", "foo.c", "foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"},
+			deletes:  []uint64{4, 5, 6},
+			filters:  []string{"foo.a", "foo.c"},
+			maxSeq:   8,
+			want:     []uint64{1, 3},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Each block holds three messages, so deleting 4-6 removes block 2.
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+				StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+			require_NoError(t, err)
+			defer fs.Stop()
+			for _, subject := range test.subjects {
+				_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+				require_NoError(t, err)
+			}
+			for _, seq := range test.deletes {
+				removed, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+				require_True(t, removed)
+			}
+			seqs, err := fs.MultiLastSeqs(test.filters, test.maxSeq, 0)
+			require_NoError(t, err)
+			if !slices.Equal(seqs, test.want) {
+				t.Errorf("MultiLastSeqs: expected %v, got %v", test.want, seqs)
+			}
+			var delivered []uint64
+			total, pending, err := fs.MultiLastMsgs(test.filters, 0, test.maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+				delivered = append(delivered, sm.seq)
+				return true
+			})
+			require_NoError(t, err)
+			require_Equal(t, total, uint64(len(test.want)))
+			require_Equal(t, pending, uint64(0))
+			if !slices.Equal(delivered, test.want) {
+				t.Errorf("MultiLastMsgs: expected %v, got %v", test.want, delivered)
+			}
+		})
+	}
+}
+
+func TestFileStoreMultiLastSeqsOverlappingFilters(t *testing.T) {
+	// Each block holds three messages, placing foo.a and foo.b in separate blocks.
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 128},
+		StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+	for _, subject := range []string{"foo.a", "foo.a", "foo.a", "foo.b", "foo.b", "foo.b"} {
+		_, _, err := fs.StoreMsg(subject, nil, []byte("x"), 0)
+		require_NoError(t, err)
+	}
+
+	filters := []string{"foo.*", "foo.a"}
+	const maxSeq = 5
+	want := []uint64{3, 5}
+	seqs, err := fs.MultiLastSeqs(filters, maxSeq, 0)
+	require_NoError(t, err)
+	if !slices.Equal(seqs, want) {
+		t.Errorf("MultiLastSeqs: expected %v, got %v", want, seqs)
+	}
+	var delivered []uint64
+	total, pending, err := fs.MultiLastMsgs(filters, 0, maxSeq, 1024, func(sm *StoreMsg, _ uint64) bool {
+		delivered = append(delivered, sm.seq)
+		return true
+	})
+	require_NoError(t, err)
+	require_Equal(t, total, uint64(len(want)))
+	require_Equal(t, pending, uint64(0))
+	if !slices.Equal(delivered, want) {
+		t.Errorf("MultiLastMsgs: expected %v, got %v", want, delivered)
+	}
 }
 
 func TestFileStoreMultiLastSeqsMaxAllowed(t *testing.T) {
@@ -9020,6 +9129,65 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func BenchmarkFileStoreLoadNextMsgMultiRepeatedSubjects(b *testing.B) {
+	for _, test := range []struct {
+		name   string
+		keys   int
+		msgs   int
+		pad    int
+		blocks int
+	}{
+		{"RepeatedMoreSubjects", 4000, 40000, 0, 1},
+		{"RepeatedAcrossBlocks", 2000, 16000, 2048, 5},
+		{"Unique", 20000, 80000, 0, 1},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{StoreDir: b.TempDir(), BlockSize: 8 * 1024 * 1024},
+				StreamConfig{Name: "bench", Subjects: []string{"data.*.*"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer fs.Stop()
+
+			payload := append([]byte(`{"v": 1}`), bytes.Repeat([]byte(" "), test.pad)...)
+			for i := range test.msgs {
+				subj := fmt.Sprintf("data.%016x.k%d", (i/4)%test.keys, i%4+1)
+				_, _, err := fs.StoreMsg(subj, nil, payload, 0)
+				require_NoError(b, err)
+			}
+			require_Equal(b, fs.numMsgBlocks(), test.blocks)
+
+			for _, multi := range []bool{true, false} {
+				name := "Single"
+				sl := gsl.NewSublist[struct{}]()
+				if multi {
+					name = "Multi"
+					for kind := 1; kind <= 4; kind++ {
+						require_NoError(b, sl.Insert(fmt.Sprintf("data.*.k%d", kind), struct{}{}))
+					}
+				} else {
+					require_NoError(b, sl.Insert("data.*.*", struct{}{}))
+				}
+				b.Run(name, func(b *testing.B) {
+					var smv StoreMsg
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						for seq := uint64(1); seq <= uint64(test.msgs); seq++ {
+							sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
+							if err != nil {
+								b.Fatal(err)
+							}
+							if nseq != seq || sm.seq != seq {
+								b.Fatalf("Expected sequence %d, got %d (%d)", seq, nseq, sm.seq)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
 	sd := t.TempDir()
 	fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
@@ -9356,6 +9524,57 @@ func TestFileStoreRecoverFullStateDetectCorruptState(t *testing.T) {
 
 	err = fs.recoverFullState()
 	require_Error(t, err, errCorruptState)
+}
+
+func TestFileStoreRecoverFullStateBoundsCounts(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir()}
+	cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage}
+	fs, err := newFileStore(fcfg, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	msg := []byte("abc")
+	for i := 1; i <= 10; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	key := sha256.Sum256([]byte(cfg.Name))
+	hh, err := highwayhash.NewDigest64(key[:])
+	require_NoError(t, err)
+
+	for _, test := range []struct {
+		title  string
+		fields []uint64
+	}{
+		{"SubjectCount", []uint64{1 << 40}},
+		{"SubjectLen", []uint64{1, math.MaxInt64}},
+		{"BlockCount", []uint64{0, 1 << 62}},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			fs.Stop()
+
+			// Empty stream state, followed by the counts under test and some padding.
+			buf := []byte{fullStateMagic, fullStateVersion, 0, 0, 0, 0, 0, 0}
+			for _, f := range test.fields {
+				buf = binary.AppendUvarint(buf, f)
+			}
+			buf = append(buf, make([]byte, 32)...)
+			hh.Reset()
+			hh.Write(buf)
+			buf = hh.Sum(buf)
+			sfile := filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)
+			require_NoError(t, os.WriteFile(sfile, buf, defaultFilePerms))
+
+			// Must reject the state and rebuild from the blocks.
+			fs, err = newFileStore(fcfg, cfg)
+			require_NoError(t, err)
+			state := fs.State()
+			require_Equal(t, state.Msgs, 10)
+			require_Equal(t, state.FirstSeq, 1)
+			require_Equal(t, state.LastSeq, 10)
+		})
+	}
 }
 
 func TestFileStoreResetConsumerToStreamState(t *testing.T) {
